@@ -1,25 +1,13 @@
-use std::collections::HashMap;
-use std::sync::Arc;
-
 use backend::HeaderName;
 use tokio::net::{TcpListener, TcpStream};
 use sha1::{Sha1, Digest};
 
 use backend::request::{Method, Request};
 use backend::response::{Response, Status};
-use tokio::sync::Mutex;
-use websockets::{WebSocket, Message};
-
-pub struct AppData {
-    sockets: HashMap<usize, WebSocket<Box<dyn Fn(Message)>, Box<dyn FnOnce()>, Box<dyn FnOnce()>>>,
-}
-
-type SharedAppData = Arc<Mutex<AppData>>;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let server = TcpListener::bind(("127.0.0.1", 8080)).await?;
-    let app_data = Arc::new(Mutex::new(AppData { sockets: HashMap::new() }));
 
     loop {
         let (mut stream, _) = if let Ok(s) = server.accept().await {
@@ -41,11 +29,11 @@ async fn main() -> anyhow::Result<()> {
             let _ = response.try_write_to(&mut stream).await;
             continue;
         };
-        let _ = handle(request, stream, Arc::clone(&app_data)).await;
+        let _ = handle(request, stream).await;
     }
 }
 
-async fn handle(req: Request, mut stream: TcpStream, data: SharedAppData) -> anyhow::Result<()> {
+async fn handle(req: Request, mut stream: TcpStream) -> anyhow::Result<()> {
     let mut upgraded_to_ws = false;
     let response: Response = match (req.method(), req.path()) {
         (Method::Get, "/") | (Method::Get, "/index.html") => {
@@ -79,16 +67,6 @@ async fn handle(req: Request, mut stream: TcpStream, data: SharedAppData) -> any
 
     if upgraded_to_ws {
         // save websocket
-        tokio::spawn(async move {
-            let ws = WebSocket::builder()
-                .on_message(Box::new(|m: Message| { dbg!(m); }) as Box<dyn Fn(Message)>)
-                .on_close(Box::new(|| { dbg!("error"); }) as Box<dyn FnOnce()>)
-                .on_error(Box::new(|| { dbg!("close"); }) as Box<dyn FnOnce()>)
-                .build(stream);
-            let mut d = data.lock().await;
-            let id = d.sockets.len();
-            d.sockets.insert(id, ws);
-        });
     }
 
     Ok(())

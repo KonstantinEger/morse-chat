@@ -1,100 +1,26 @@
-use tokio::net::TcpStream;
-use std::marker::PhantomData;
-use frame::{Frame, OpCode};
+use std::{pin::Pin, task::{Context, Poll}, sync::Arc, collections::VecDeque};
+
+use pin_project::pin_project;
+use futures::Future;
+use tokio::{net::TcpStream, task::{self, JoinHandle}, sync::Mutex};
+use tokio::sync::mpsc::{self, Sender};
 
 mod frame;
 
-pub struct WebSocket<M, C, E> {
-    stream: TcpStream,
-    on_message: M,
-    on_close: C,
-    on_error: E,
+pub struct WebSocket {
+    stream_task: JoinHandle<()>,
+    recv_queue: Arc<Mutex<VecDeque<Result<Message, MessageError>>>>,
+    cmd_channel: Sender<Cmd>,
 }
 
-impl<M, C, E> WebSocket<M, C, E> {
-    pub fn builder() -> Builder<M, C, E, Unset, Unset, Unset> {
-        Builder::new()
-    }
-
-    async fn next_message(&mut self) -> Result<Message, MessageError> {
-        let mut message = Vec::new();
-        let mut is_text = None;
-
-        loop {
-            let mut frame = Frame::try_parse_from(&mut self.stream)
-                .await
-                .map_err(|_| MessageError::InvalidMessage)?;
-
-            if is_text.is_none() {
-                is_text = Some(matches!(frame.opcode(), OpCode::Text));
-            }
-
-            if let Some(mask) = frame.mask() {
-                frame::demask(frame.payload_mut(), mask);
-            }
-
-            if frame.opcode().is_non_control() {
-                message.extend_from_slice(frame.payload());
-            }
-
-            if matches!(frame.opcode(), OpCode::Close) {
-                Frame::builder()
-                    .is_final()
-                    .with_opcode(OpCode::Close)
-                    .with_payload(frame.payload().to_owned())
-                    .write_to(&mut self.stream)
-                    .await
-                    .map_err(|_| MessageError::Network)?;
-                return Err(MessageError::ConnectionClosed);
-            } else if matches!(frame.opcode(), OpCode::Ping) {
-                Frame::builder()
-                    .is_final()
-                    .with_opcode(OpCode::Pong)
-                    .with_payload(frame.payload().to_owned())
-                    .write_to(&mut self.stream)
-                    .await
-                    .map_err(|_| MessageError::Network)?;
-            }
-
-            if frame.is_final() {
-                break;
-            }
-        }
-
-        if let Some(true) = is_text {
-            Ok(Message::Text(String::from_utf8_lossy(message.as_slice()).to_string()))
-        } else {
-            Ok(Message::Binary(message))
-        }
-    }
+enum Cmd {
+    Close,
+    Send(Message),
 }
 
-impl<M, C, E> WebSocket<M, C, E>
-where
-    M: Fn(Message),
-    C: FnOnce(),
-    E: FnOnce(),
-{
-    pub async fn listen(mut self) {
-        loop {
-            match self.next_message().await {
-                Ok(msg) => {
-                    let on_msg = &self.on_message;
-                    on_msg(msg);
-                },
-                Err(MessageError::ConnectionClosed) => {
-                    let on_close = self.on_close;
-                    on_close();
-                    break;
-                },
-                Err(_) => {
-                    let on_err = self.on_error;
-                    on_err();
-                    break;
-                }
-            }
-        }
-    }
+enum NextStep {
+    Read,
+    Write(Cmd),
 }
 
 #[derive(Debug, Clone)]
@@ -103,68 +29,130 @@ pub enum Message {
     Binary(Vec<u8>),
 }
 
+#[derive(Debug, Clone)]
 pub enum MessageError {
     ConnectionClosed,
     InvalidMessage,
     Network,
 }
 
-pub struct Set();
-pub struct Unset();
-
-pub struct Builder<M, C, E, MF, CF, EF> {
-    on_close: Option<C>,
-    on_message: Option<M>,
-    on_error: Option<E>,
-    _p: PhantomData<(MF, CF, EF)>,
+#[pin_project]
+struct NextStepFuture<S, C> {
+    #[pin]
+    stream: S,
+    #[pin]
+    channel: C,
 }
 
-impl<M, C, E> Builder<M, C, E, Unset, Unset, Unset> {
-    pub fn new() -> Self {
-        Self { on_close: None, on_message: None, on_error: None, _p: PhantomData }
+impl WebSocket {
+    const CMD_CHANNEL_BUF_SIZE: usize = 10;
+
+    /// Starts a background task reading and writing messages from the stream.
+    ///
+    /// For sending messages, use [WebSocket::try_send]. For getting a newly
+    /// received message from the queue, use [WebSocket::next_message_if_exists].
+    /// To close the websocket and with it the `TcpStream`, use [WebSocket::shutdown].
+    pub fn new(stream: TcpStream) -> Self {
+        let (cmd_channel, mut rx) = mpsc::channel(Self::CMD_CHANNEL_BUF_SIZE);
+        let queue = Arc::new(Mutex::new(VecDeque::new()));
+        let queue_clone = Arc::clone(&queue);
+        let stream_task = task::spawn(async move {
+            let mut stream = stream;
+            loop {
+                let next_step = NextStepFuture::new(stream.peek(&mut [0]), rx.recv()).await;
+                match next_step {
+                    NextStep::Read => {
+                        let msg = read_message_from(&mut stream).await;
+                        let should_close = msg.is_err();
+                        queue_clone.lock().await.push_back(msg);
+                        if should_close {
+                            break;
+                        }
+                    },
+                    NextStep::Write(cmd) => {
+                        let should_close = if let Cmd::Send(msg) = cmd {
+                            let res = write_message_to(msg, &mut stream).await;
+                            res.is_err()
+                        } else {
+                            true
+                        };
+                        if should_close {
+                            break;
+                        }
+                    },
+                }
+            }
+        });
+        Self {
+            stream_task,
+            cmd_channel,
+            recv_queue: queue,
+        }
+    }
+
+    pub async fn shutdown(self) -> Result<(), &'static str> {
+        self.cmd_channel
+            .send(Cmd::Close)
+            .await
+            .map_err(|_| "error sending close command to task")?;
+        self.stream_task
+            .await
+            .map_err(|_| "error waiting on task to end")
+    }
+
+    /// Returns the next read message if it exists. This function does not wait for a new message.
+    pub async fn next_message_if_exists(&self) -> Option<Result<Message, MessageError>> {
+        let mut lock = self.recv_queue.lock().await;
+        lock.pop_front()
+    }
+
+    pub async fn try_send(&self, msg: Message) -> Result<(), Message> {
+        self.cmd_channel
+            .send(Cmd::Send(msg))
+            .await
+            .map_err(|e| e.0.message().unwrap())
     }
 }
 
-impl<M, C, E, CF, EF> Builder<M, C, E, Unset, CF, EF> {
-    pub fn on_message(self, on_message: M) -> Builder<M, C, E, Set, CF, EF> {
-        Builder {
-            on_message: Some(on_message),
-            on_error: self.on_error,
-            on_close: self.on_close,
-            _p: PhantomData,
+async fn read_message_from(stream: &mut TcpStream) -> Result<Message, MessageError> {
+    todo!()
+}
+
+async fn write_message_to(message: Message, stream: &mut TcpStream) -> Result<(), &'static str> {
+    todo!()
+}
+
+impl<S, C> NextStepFuture<S, C> {
+    pub fn new(stream: S, channel: C) -> Self {
+        Self { stream, channel }
+    }
+}
+
+impl<S, C> Future for NextStepFuture<S, C>
+where
+    S: Future<Output = std::io::Result<usize>>,
+    C: Future<Output = Option<Cmd>>,
+{
+    type Output = NextStep;
+
+    fn poll(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+        match this.stream.poll(ctx) {
+            Poll::Ready(_) => return Poll::Ready(NextStep::Read),
+            _ => {},
+        };
+        match this.channel.poll(ctx) {
+            Poll::Ready(cmd) => return Poll::Ready(NextStep::Write(cmd.unwrap())),
+            _ => return Poll::Pending,
         }
     }
 }
 
-impl<M, C, E, MF, EF> Builder<M, C, E, MF, Unset, EF> {
-    pub fn on_close(self, on_close: C) -> Builder<M, C, E, MF, Set, EF> {
-        Builder {
-            on_message: self.on_message,
-            on_error: self.on_error,
-            on_close: Some(on_close),
-            _p: PhantomData,
-        }
-    }
-}
-
-impl<M, C, E, MF, CF> Builder<M, C, E, MF, CF, Unset> {
-    pub fn on_error(self, on_error: E) -> Builder<M, C, E, MF, CF, Set> {
-        Builder {
-            on_message: self.on_message,
-            on_error: Some(on_error),
-            on_close: self.on_close,
-            _p: PhantomData,
-        }
-    }
-}
-
-impl<M, C, E> Builder<M, C, E, Set, Set, Set> {
-    pub fn build(self, stream: TcpStream) -> WebSocket<M, C, E> {
-        WebSocket {
-            stream,
-            on_message: self.on_message.unwrap(),
-            on_close: self.on_close.unwrap(),
-            on_error: self.on_error.unwrap(),
+impl Cmd {
+    pub fn message(self) -> Option<Message> {
+        match self {
+            Self::Send(m) => Some(m),
+            Self::Close => None,
         }
     }
 }
