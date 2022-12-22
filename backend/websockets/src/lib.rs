@@ -4,7 +4,7 @@ use frame::{Frame, OpCode};
 use pin_project::pin_project;
 use futures::Future;
 use tokio::{net::TcpStream, task::{self, JoinHandle}, sync::Mutex};
-use tokio::sync::mpsc::{self, Sender, Receiver};
+use tokio::sync::mpsc::{self, Sender};
 
 mod frame;
 
@@ -12,7 +12,6 @@ pub struct WebSocket {
     stream_task: JoinHandle<()>,
     recv_queue: Arc<Mutex<VecDeque<Result<Message, MessageError>>>>,
     cmd_channel: Sender<Cmd>,
-    notify_receiver: Receiver<()>,
 }
 
 enum Cmd {
@@ -48,7 +47,6 @@ struct NextStepFuture<S, C> {
 
 impl WebSocket {
     const CMD_CHANNEL_BUF_SIZE: usize = 10;
-    const NOTIFY_CHANNEL_BUFF_SIZE: usize = 5;
 
     /// Starts a background task reading and writing messages from the stream.
     ///
@@ -57,7 +55,6 @@ impl WebSocket {
     /// To close the websocket and with it the `TcpStream`, use [WebSocket::shutdown].
     pub fn new(stream: TcpStream) -> Self {
         let (cmd_channel, mut rx) = mpsc::channel(Self::CMD_CHANNEL_BUF_SIZE);
-        let (notify_sender, notify_receiver) = mpsc::channel(Self::NOTIFY_CHANNEL_BUFF_SIZE);
         let queue = Arc::new(Mutex::new(VecDeque::new()));
         let queue_clone = Arc::clone(&queue);
         let stream_task = task::spawn(async move {
@@ -69,7 +66,6 @@ impl WebSocket {
                         let msg = read_message_from(&mut stream).await;
                         let should_close = msg.is_err();
                         queue_clone.lock().await.push_back(msg);
-                        let should_close = notify_sender.send(()).await.is_err() || should_close;
                         if should_close {
                             break;
                         }
@@ -79,6 +75,7 @@ impl WebSocket {
                             let res = write_message_to(msg, &mut stream).await;
                             res.is_err()
                         } else {
+                            let _ = close_connection(&mut stream).await;
                             true
                         };
                         if should_close {
@@ -91,7 +88,6 @@ impl WebSocket {
         Self {
             stream_task,
             cmd_channel,
-            notify_receiver,
             recv_queue: queue,
         }
     }
@@ -107,14 +103,9 @@ impl WebSocket {
     }
 
     /// Returns the next read message if it exists. This function does not wait for a new message.
-    pub async fn next_message_if_exists(&self) -> Option<Result<Message, MessageError>> {
+    pub async fn poll_next_message(&self) -> Option<Result<Message, MessageError>> {
         let mut lock = self.recv_queue.lock().await;
         lock.pop_front()
-    }
-
-    pub async fn wait_for_next_message(&mut self) -> Option<Result<Message, MessageError>> {
-        self.notify_receiver.recv().await;
-        self.next_message_if_exists().await
     }
 
     pub async fn try_send(&self, msg: Message) -> Result<(), Message> {
@@ -133,7 +124,6 @@ async fn read_message_from(stream: &mut TcpStream) -> Result<Message, MessageErr
         let mut frame = Frame::try_parse_from(stream)
             .await
             .map_err(|_| MessageError::InvalidMessage)?;
-        dbg!(&frame);
 
         if is_text.is_none() {
             is_text = Some(matches!(frame.opcode(), OpCode::Text));
@@ -207,6 +197,15 @@ async fn write_message_to(message: Message, stream: &mut TcpStream) -> Result<()
     }
     
     Ok(())
+}
+
+async fn close_connection(stream: &mut TcpStream) -> Result<(), &'static str> {
+    Frame::builder()
+        .is_final()
+        .with_opcode(OpCode::Close)
+        .with_payload(Vec::new())
+        .write_to(stream)
+        .await
 }
 
 impl<S, C> NextStepFuture<S, C> {

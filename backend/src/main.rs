@@ -4,7 +4,6 @@ use std::sync::Arc;
 use backend::HeaderName;
 use tokio::net::{TcpListener, TcpStream};
 use sha1::{Sha1, Digest};
-use futures::future::select_all;
 
 use backend::request::{Method, Request};
 use backend::response::{Response, Status};
@@ -24,7 +23,7 @@ async fn main() -> anyhow::Result<()> {
     let server = TcpListener::bind(("127.0.0.1", 8080)).await?;
     let app_data: SharedAppData = Arc::new(Mutex::new(Default::default()));
 
-    let mut listener_task: Option<JoinHandle<()>> = None;
+    let _listener_task = task::spawn(msg_listener_task(Arc::clone(&app_data)));
 
     loop {
         let (mut stream, _) = if let Ok(s) = server.accept().await {
@@ -41,15 +40,40 @@ async fn main() -> anyhow::Result<()> {
             let _ = response.try_write_to(&mut stream).await;
             continue;
         };
-        let _ = handle(request, stream, Arc::clone(&app_data), &mut listener_task).await;
+        let _ = handle(request, stream, Arc::clone(&app_data)).await;
+    }
+}
+
+async fn msg_listener_task(app_data: SharedAppData) {
+    println!("task started");
+    loop {
+        let mut delete_ids = Vec::new();
+        let mut lock = app_data.lock().await;
+        for (&id, socket) in &lock.sockets {
+            let msg = socket.poll_next_message().await;
+            match msg {
+                Some(Err(e)) => {
+                    dbg!(e);
+                    delete_ids.push(id);
+                },
+                Some(Ok(msg)) => {
+                    dbg!(id, msg);
+                },
+                _ => {}
+            }
+        }
+        for id in delete_ids {
+            lock.sockets.remove(&id);
+        }
+        drop(lock);
+        tokio::time::sleep(std::time::Duration::from_millis(16)).await;
     }
 }
 
 async fn handle(
     req: Request,
     mut stream: TcpStream,
-    app_data: SharedAppData,
-    listener_task: &mut Option<JoinHandle<()>>
+    app_data: SharedAppData
 ) -> anyhow::Result<()> {
     let mut upgraded_to_ws = false;
     let response: Response = match (req.method(), req.path()) {
@@ -83,27 +107,9 @@ async fn handle(
 
     if upgraded_to_ws {
         let ws = WebSocket::new(stream);
-        println!("foo");
         let mut lock = app_data.lock().await;
         let id = lock.sockets.len();
         lock.sockets.insert(id, ws);
-        println!("bar");
-        if listener_task.is_none() {
-            let app_data_clone = Arc::clone(&app_data);
-            *listener_task = Some(task::spawn(async move {
-                println!("task started");
-                loop {
-                    let mut lock = app_data_clone.lock().await;
-                    for (&id, socket) in &lock.sockets {
-                        if let Some(msg) = socket.next_message_if_exists().await {
-                            dbg!(msg);
-                        }
-                    }
-                    drop(lock);
-                    tokio::time::sleep(std::time::Duration::from_millis(16)).await;
-                }
-            }));
-        }
     }
 
     Ok(())
