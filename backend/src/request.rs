@@ -8,7 +8,7 @@ pub struct Request {
     method: Method,
     path: String,
     version: String,
-    headers: HashMap<HeaderName, String>
+    headers: HashMap<HeaderName, String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

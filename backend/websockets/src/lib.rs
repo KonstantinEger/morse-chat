@@ -8,6 +8,7 @@ use tokio::sync::mpsc::{self, Sender};
 
 mod frame;
 
+#[derive(Debug)]
 pub struct WebSocket {
     stream_task: JoinHandle<()>,
     recv_queue: Arc<Mutex<VecDeque<Result<Message, MessageError>>>>,

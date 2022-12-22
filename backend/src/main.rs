@@ -4,6 +4,7 @@ use std::sync::Arc;
 use backend::HeaderName;
 use tokio::net::{TcpListener, TcpStream};
 use sha1::{Sha1, Digest};
+use rand::Rng;
 
 use backend::request::{Method, Request};
 use backend::response::{Response, Status};
@@ -13,7 +14,7 @@ use websockets::WebSocket;
 
 #[derive(Default)]
 struct AppData {
-    sockets: HashMap<usize, WebSocket>,
+    rooms: HashMap<String, HashMap<usize, WebSocket>>,
 }
 
 type SharedAppData = Arc<Mutex<AppData>>;
@@ -21,7 +22,8 @@ type SharedAppData = Arc<Mutex<AppData>>;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let server = TcpListener::bind(("127.0.0.1", 8080)).await?;
-    let app_data: SharedAppData = Arc::new(Mutex::new(Default::default()));
+    let rooms = HashMap::from([(String::from("asdf"), HashMap::new())]);
+    let app_data: SharedAppData = Arc::new(Mutex::new(AppData { rooms }));
 
     let _listener_task = task::spawn(msg_listener_task(Arc::clone(&app_data)));
 
@@ -45,74 +47,119 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn msg_listener_task(app_data: SharedAppData) {
-    println!("task started");
     loop {
-        let mut delete_ids = Vec::new();
-        let mut lock = app_data.lock().await;
-        for (&id, socket) in &lock.sockets {
-            let msg = socket.poll_next_message().await;
-            match msg {
-                Some(Err(e)) => {
-                    dbg!(e);
-                    delete_ids.push(id);
-                },
-                Some(Ok(msg)) => {
-                    dbg!(id, msg);
-                },
-                _ => {}
+        let mut data = app_data.lock().await;
+        for (_, room) in &mut data.rooms {
+            let mut delete_members = Vec::new();
+            // collect messages
+            let mut messages = Vec::with_capacity(room.len());
+            for (&id, socket) in &*room {
+                match socket.poll_next_message().await {
+                    Some(Err(e)) => {
+                        dbg!(e);
+                        delete_members.push(id);
+                    },
+                    Some(Ok(msg)) => {
+                        messages.push((id, msg));
+                    },
+                    None => {},
+                }
+            }
+            // cleanup
+            for id in delete_members {
+                room.remove(&id);
+            }
+            // send messages
+            for (sender_id, message) in messages {
+                for (_, socket) in (&*room).into_iter().filter(|(&id, _)| id != sender_id) {
+                    socket.try_send(message.clone()).await.unwrap();
+                }
             }
         }
-        for id in delete_ids {
-            lock.sockets.remove(&id);
-        }
-        drop(lock);
-        tokio::time::sleep(std::time::Duration::from_millis(16)).await;
+        drop(data);
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
 }
 
-async fn handle(
-    req: Request,
-    mut stream: TcpStream,
-    app_data: SharedAppData
-) -> anyhow::Result<()> {
-    let mut upgraded_to_ws = false;
-    let response: Response = match (req.method(), req.path()) {
+async fn handle(req: Request, mut stream: TcpStream, app_data: SharedAppData) -> anyhow::Result<()> {
+    match (req.method(), req.path()) {
         (Method::Get, "/") | (Method::Get, "/index.html") => {
             // serve index html
             let html = include_str!("../../frontend/index.html");
             Response::builder()
                 .as_html()
                 .with_body(html)
+                .try_write_to(&mut stream)
+                .await?;
         },
-        (Method::Get, "/ws") if fulfills_ws_requirements(&req) => {
-            // upgrade to websocket
-            upgraded_to_ws = true;
-            let nonce = req.headers().get(&HeaderName::from_str("sec-websocket-key")).unwrap();
-            let hash = get_websocket_accept_hash(nonce);
-            Response::builder()
-                .with_status(Status::SwitchingProtocols)
-                .with_header("connection", "Upgrade")
-                .with_header("upgrade", "websocket")
-                .with_header("sec-websocket-accept", hash)
-                .with_body(Vec::new())
+        (Method::Get, path) if path.starts_with("/ws") => {
+            println!("start new ws");
+            handle_new_ws(&req, stream, app_data).await;
         },
         (_, path) => {
             Response::builder()
                 .with_status(Status::NotFound)
                 .with_body(format!("Error 404: no resource with path {} found", path))
+                .try_write_to(&mut stream)
+                .await?;
         }
     };
+    Ok(())
+}
 
-    response.try_write_to(&mut stream).await?;
+async fn handle_new_ws(request: &Request, mut stream: TcpStream, app_data: SharedAppData) {
+    let (response, room_name) = if let Some(res) = try_upgrade_to_ws(request) {
+        res
+    } else {
+        let _ = Response::builder()
+            .with_status(Status::BadRequest)
+            .with_body(Vec::new())
+            .try_write_to(&mut stream)
+            .await;
+        return;
+    };
+    let mut data = app_data.lock().await;
+    let room = if let Some(room) = data.rooms.get_mut(&room_name) {
+        room
+    } else {
+        let _ = Response::builder()
+            .with_status(Status::NotFound)
+            .with_body(format!("no room with name {} found.", room_name))
+            .try_write_to(&mut stream)
+            .await;
+        return;
+    };
 
-    if upgraded_to_ws {
-        let ws = WebSocket::new(stream);
-        let mut lock = app_data.lock().await;
-        let id = lock.sockets.len();
-        lock.sockets.insert(id, ws);
+    if let Err(e) = response.try_write_to(&mut stream).await {
+        dbg!(e);
+        return;
     }
 
-    Ok(())
+    let mut rng = rand::thread_rng();
+
+    let id = rng.gen();
+    let socket = WebSocket::new(stream);
+    room.insert(id, socket);
+}
+
+fn try_upgrade_to_ws(request: &Request) -> Option<(Response, String)> {
+    if !fulfills_ws_requirements(request) {
+        return None;
+    }
+
+    let (_, room) = get_query_params(request.path())
+        .find(|(key, _)| *key == "room")?;
+
+    // upgrade to websocket
+    let nonce = request.headers().get(&HeaderName::from_str("sec-websocket-key")).unwrap();
+    let hash = get_websocket_accept_hash(nonce);
+    let resp = Response::builder()
+        .with_status(Status::SwitchingProtocols)
+        .with_header("connection", "Upgrade")
+        .with_header("upgrade", "websocket")
+        .with_header("sec-websocket-accept", hash)
+        .with_body(Vec::new());
+    Some((resp, room.to_owned()))
 }
 
 fn get_websocket_accept_hash(nonce: &str) -> String {
@@ -130,5 +177,12 @@ fn fulfills_ws_requirements(req: &Request) -> bool {
         .and_then(|has_conn| Some(has_conn && req.headers()
                   .get(&HeaderName::from_str("upgrade"))?
                   .to_ascii_lowercase() == "websocket"))
+        .map(|prev| prev && req.headers().get(&HeaderName::from_str("sec-websocket-key")).is_some())
         .unwrap_or(false)
+}
+
+fn get_query_params(string: &str) -> impl Iterator<Item = (&str, &str)> {
+    string.split(&['?', '&'])
+        .skip(1)
+        .flat_map(|pair| pair.split_once('='))
 }
