@@ -1,39 +1,56 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use backend::HeaderName;
 use tokio::net::{TcpListener, TcpStream};
 use sha1::{Sha1, Digest};
+use futures::future::select_all;
 
 use backend::request::{Method, Request};
 use backend::response::{Response, Status};
+use tokio::sync::Mutex;
+use tokio::task::{self, JoinHandle};
+use websockets::WebSocket;
+
+#[derive(Default)]
+struct AppData {
+    sockets: HashMap<usize, WebSocket>,
+}
+
+type SharedAppData = Arc<Mutex<AppData>>;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let server = TcpListener::bind(("127.0.0.1", 8080)).await?;
+    let app_data: SharedAppData = Arc::new(Mutex::new(Default::default()));
+
+    let mut listener_task: Option<JoinHandle<()>> = None;
 
     loop {
         let (mut stream, _) = if let Ok(s) = server.accept().await {
-            println!("accepted connection");
             s
         } else {
-            println!("refused connection");
             continue;
         };
         let request = if let Ok(req) = Request::try_parse_from(&mut stream).await {
-            println!("successfully parsed request to {}", req.path());
-            println!("request: {:#?}", &req);
             req
         } else {
-            println!("failed to parse request");
             let response = Response::builder()
                 .with_status(Status::BadRequest)
                 .with_body(Vec::new());
             let _ = response.try_write_to(&mut stream).await;
             continue;
         };
-        let _ = handle(request, stream).await;
+        let _ = handle(request, stream, Arc::clone(&app_data), &mut listener_task).await;
     }
 }
 
-async fn handle(req: Request, mut stream: TcpStream) -> anyhow::Result<()> {
+async fn handle(
+    req: Request,
+    mut stream: TcpStream,
+    app_data: SharedAppData,
+    listener_task: &mut Option<JoinHandle<()>>
+) -> anyhow::Result<()> {
     let mut upgraded_to_ws = false;
     let response: Response = match (req.method(), req.path()) {
         (Method::Get, "/") | (Method::Get, "/index.html") => {
@@ -63,10 +80,30 @@ async fn handle(req: Request, mut stream: TcpStream) -> anyhow::Result<()> {
     };
 
     response.try_write_to(&mut stream).await?;
-    println!("successfully sent response");
 
     if upgraded_to_ws {
-        // save websocket
+        let ws = WebSocket::new(stream);
+        println!("foo");
+        let mut lock = app_data.lock().await;
+        let id = lock.sockets.len();
+        lock.sockets.insert(id, ws);
+        println!("bar");
+        if listener_task.is_none() {
+            let app_data_clone = Arc::clone(&app_data);
+            *listener_task = Some(task::spawn(async move {
+                println!("task started");
+                loop {
+                    let mut lock = app_data_clone.lock().await;
+                    for (&id, socket) in &lock.sockets {
+                        if let Some(msg) = socket.next_message_if_exists().await {
+                            dbg!(msg);
+                        }
+                    }
+                    drop(lock);
+                    tokio::time::sleep(std::time::Duration::from_millis(16)).await;
+                }
+            }));
+        }
     }
 
     Ok(())
