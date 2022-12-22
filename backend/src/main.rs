@@ -8,7 +8,7 @@ use sha1::{Sha1, Digest};
 use backend::request::{Method, Request};
 use backend::response::{Response, Status};
 use tokio::sync::Mutex;
-use tokio::task::{self, JoinHandle};
+use tokio::task;
 use websockets::WebSocket;
 
 #[derive(Default)]
