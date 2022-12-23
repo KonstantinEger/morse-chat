@@ -21,7 +21,7 @@ type SharedAppData = Arc<Mutex<AppData>>;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let server = TcpListener::bind(("127.0.0.1", 8080)).await?;
+    let server = TcpListener::bind(("0.0.0.0", 8080)).await?;
     let rooms = HashMap::from([(String::from("asdf"), HashMap::new())]);
     let app_data: SharedAppData = Arc::new(Mutex::new(AppData { rooms }));
 
@@ -77,12 +77,31 @@ async fn msg_listener_task(app_data: SharedAppData) {
             }
         }
         drop(data);
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        // 120 Hz
+        tokio::time::sleep(std::time::Duration::from_millis(8)).await;
     }
 }
 
 async fn handle(req: Request, mut stream: TcpStream, app_data: SharedAppData) -> anyhow::Result<()> {
     match (req.method(), req.path()) {
+        (Method::Get, path) if path.starts_with("/chat") => {
+            let html = include_str!("../../frontend/chat.html");
+            Response::builder()
+                .as_html()
+                .with_body(html)
+                .try_write_to(&mut stream)
+                .await?;
+        },
+        (Method::Get, "/scripts/chat.js") => {
+            Response::builder()
+                .as_js()
+                .with_body(include_str!("../../frontend/scripts/chat.js"))
+                .try_write_to(&mut stream)
+                .await?;
+        },
+        (Method::Get, path) if path.starts_with("/ws") => {
+            handle_new_ws(&req, stream, app_data).await;
+        },
         (Method::Get, "/") | (Method::Get, "/index.html") => {
             // serve index html
             let html = include_str!("../../frontend/index.html");
@@ -91,10 +110,6 @@ async fn handle(req: Request, mut stream: TcpStream, app_data: SharedAppData) ->
                 .with_body(html)
                 .try_write_to(&mut stream)
                 .await?;
-        },
-        (Method::Get, path) if path.starts_with("/ws") => {
-            println!("start new ws");
-            handle_new_ws(&req, stream, app_data).await;
         },
         (_, path) => {
             Response::builder()
