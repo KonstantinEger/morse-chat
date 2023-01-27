@@ -68,6 +68,10 @@ impl Builder {
         self
     }
 
+    pub fn as_css(&mut self) -> &mut Self {
+        self.with_header("content-type", "text/css")
+    }
+
     pub fn as_js(&mut self) -> &mut Self {
         self.with_header("content-type", "text/javascript")
     }

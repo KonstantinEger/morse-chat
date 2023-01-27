@@ -26,9 +26,18 @@ impl Request {
         let mut first_line = String::new();
         r.read_line(&mut first_line).await?;
         let mut first_line_split = first_line.split(' ');
-        let method = first_line_split.next().ok_or(ParseError("expected HTTP method"))?;
-        let path = first_line_split.next().ok_or(ParseError("expected path"))?.to_owned();
-        let version = first_line_split.next().ok_or(ParseError("expected HTTP version"))?.trim().to_owned();
+        let method = first_line_split
+            .next()
+            .ok_or(ParseError("expected HTTP method"))?;
+        let path = first_line_split
+            .next()
+            .ok_or(ParseError("expected path"))?
+            .to_owned();
+        let version = first_line_split
+            .next()
+            .ok_or(ParseError("expected HTTP version"))?
+            .trim()
+            .to_owned();
 
         let method = match method.to_ascii_uppercase().as_str() {
             "GET" => Method::Get,
@@ -42,9 +51,13 @@ impl Request {
         loop {
             let mut line = String::new();
             r.read_line(&mut line).await?;
-            if line.trim().is_empty() { break; }
+            if line.trim().is_empty() {
+                break;
+            }
 
-            let (name, value) = line.split_once(':').ok_or(ParseError("expected HTTP header"))?;
+            let (name, value) = line
+                .split_once(':')
+                .ok_or(ParseError("expected HTTP header"))?;
             headers.insert(HeaderName::from_str(name), value.trim().to_owned());
         }
 
@@ -84,3 +97,14 @@ impl std::fmt::Display for ParseError {
 }
 
 impl std::error::Error for ParseError {}
+
+impl std::fmt::Display for Method {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+        match self {
+            Self::Get => write!(f, "GET"),
+            Self::Post => write!(f, "POST"),
+            Self::Put => write!(f, "PUT"),
+            Self::Delete => write!(f, "DELETE"),
+        }
+    }
+}

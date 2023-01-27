@@ -2,14 +2,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use backend::HeaderName;
-use tokio::net::{TcpListener, TcpStream};
-use sha1::{Sha1, Digest};
 use rand::Rng;
+use sha1::{Digest, Sha1};
+use tokio::net::{TcpListener, TcpStream};
 
 use backend::request::{Method, Request};
 use backend::response::{Response, Status};
 use tokio::sync::Mutex;
 use tokio::task;
+use tracing::{debug, info, trace};
 use websockets::WebSocket;
 
 #[derive(Default)]
@@ -21,19 +22,33 @@ type SharedAppData = Arc<Mutex<AppData>>;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let server = TcpListener::bind(("0.0.0.0", 8080)).await?;
+    tracing_subscriber::fmt().init();
+    info!("starting server.");
+    let (ip, port) = ("0.0.0.0", 8080);
+    let server = TcpListener::bind((ip, port)).await?;
+    info!(ip, port, "bound tcp server.");
     let rooms = HashMap::from([(String::from("asdf"), HashMap::new())]);
     let app_data: SharedAppData = Arc::new(Mutex::new(AppData { rooms }));
 
     let _listener_task = task::spawn(msg_listener_task(Arc::clone(&app_data)));
 
     loop {
-        let (mut stream, _) = if let Ok(s) = server.accept().await {
-            s
+        let (mut stream, _) = if let Ok(stream) = server.accept().await {
+            info!(
+                addr = stream.1.to_string(),
+                "successfully accepted new tcp stream."
+            );
+            stream
         } else {
+            debug!("failed to accept tcp stream.");
             continue;
         };
         let request = if let Ok(req) = Request::try_parse_from(&mut stream).await {
+            info!(
+                method = req.method().to_string(),
+                path = req.path(),
+                "successfully parsed request."
+            );
             req
         } else {
             let response = Response::builder()
@@ -56,22 +71,26 @@ async fn msg_listener_task(app_data: SharedAppData) {
             for (&id, socket) in &*room {
                 match socket.poll_next_message().await {
                     Some(Err(e)) => {
-                        dbg!(e);
+                        debug!(error = ?e, id, "error while polling next message.");
                         delete_members.push(id);
-                    },
+                    }
                     Some(Ok(msg)) => {
+                        trace!(?msg);
                         messages.push((id, msg));
-                    },
-                    None => {},
+                    }
+                    None => {}
                 }
             }
+            trace!("collected {} messages.", messages.len());
             // cleanup
             for id in delete_members {
+                debug!(id, "removing member from room.");
                 room.remove(&id);
             }
             // send messages
             for (sender_id, message) in messages {
-                for (_, socket) in (&*room).into_iter().filter(|(&id, _)| id != sender_id) {
+                for (peer_id, socket) in (&*room).into_iter().filter(|(&id, _)| id != sender_id) {
+                    trace!(sender_id, peer_id, "sending message to other room member.");
                     socket.try_send(message.clone()).await.unwrap();
                 }
             }
@@ -82,7 +101,11 @@ async fn msg_listener_task(app_data: SharedAppData) {
     }
 }
 
-async fn handle(req: Request, mut stream: TcpStream, app_data: SharedAppData) -> anyhow::Result<()> {
+async fn handle(
+    req: Request,
+    mut stream: TcpStream,
+    app_data: SharedAppData,
+) -> anyhow::Result<()> {
     match (req.method(), req.path()) {
         (Method::Get, path) if path.starts_with("/chat") => {
             let html = include_str!("../../frontend/chat.html");
@@ -91,17 +114,24 @@ async fn handle(req: Request, mut stream: TcpStream, app_data: SharedAppData) ->
                 .with_body(html)
                 .try_write_to(&mut stream)
                 .await?;
-        },
+        }
         (Method::Get, "/scripts/chat.js") => {
             Response::builder()
                 .as_js()
                 .with_body(include_str!("../../frontend/scripts/chat.js"))
                 .try_write_to(&mut stream)
                 .await?;
-        },
+        }
+        (Method::Get, "/styles/style.css") => {
+            Response::builder()
+                .as_css()
+                .with_body(include_str!("../../frontend/styles/style.css"))
+                .try_write_to(&mut stream)
+                .await?;
+        }
         (Method::Get, path) if path.starts_with("/ws") => {
             handle_new_ws(&req, stream, app_data).await;
-        },
+        }
         (Method::Get, "/") | (Method::Get, "/index.html") => {
             // serve index html
             let html = include_str!("../../frontend/index.html");
@@ -110,7 +140,7 @@ async fn handle(req: Request, mut stream: TcpStream, app_data: SharedAppData) ->
                 .with_body(html)
                 .try_write_to(&mut stream)
                 .await?;
-        },
+        }
         (_, path) => {
             Response::builder()
                 .with_status(Status::NotFound)
@@ -122,8 +152,10 @@ async fn handle(req: Request, mut stream: TcpStream, app_data: SharedAppData) ->
     Ok(())
 }
 
+#[tracing::instrument(skip(app_data, request, stream), fields(http.ip = format!("{:?}", stream.peer_addr())))]
 async fn handle_new_ws(request: &Request, mut stream: TcpStream, app_data: SharedAppData) {
     let (response, room_name) = if let Some(res) = try_upgrade_to_ws(request) {
+        info!("successfully upgraded to websocket.");
         res
     } else {
         let _ = Response::builder()
@@ -162,11 +194,13 @@ fn try_upgrade_to_ws(request: &Request) -> Option<(Response, String)> {
         return None;
     }
 
-    let (_, room) = get_query_params(request.path())
-        .find(|(key, _)| *key == "room")?;
+    let (_, room) = get_query_params(request.path()).find(|(key, _)| *key == "room")?;
 
     // upgrade to websocket
-    let nonce = request.headers().get(&HeaderName::from_str("sec-websocket-key")).unwrap();
+    let nonce = request
+        .headers()
+        .get(&HeaderName::from_str("sec-websocket-key"))
+        .unwrap();
     let hash = get_websocket_accept_hash(nonce);
     let resp = Response::builder()
         .with_status(Status::SwitchingProtocols)
@@ -189,15 +223,28 @@ fn fulfills_ws_requirements(req: &Request) -> bool {
     req.headers()
         .get(&HeaderName::from_str("connection"))
         .map(|v| v.to_ascii_lowercase() == "upgrade")
-        .and_then(|has_conn| Some(has_conn && req.headers()
-                  .get(&HeaderName::from_str("upgrade"))?
-                  .to_ascii_lowercase() == "websocket"))
-        .map(|prev| prev && req.headers().get(&HeaderName::from_str("sec-websocket-key")).is_some())
+        .and_then(|has_conn| {
+            Some(
+                has_conn
+                    && req
+                        .headers()
+                        .get(&HeaderName::from_str("upgrade"))?
+                        .to_ascii_lowercase()
+                        == "websocket",
+            )
+        })
+        .map(|prev| {
+            prev && req
+                .headers()
+                .get(&HeaderName::from_str("sec-websocket-key"))
+                .is_some()
+        })
         .unwrap_or(false)
 }
 
 fn get_query_params(string: &str) -> impl Iterator<Item = (&str, &str)> {
-    string.split(&['?', '&'])
+    string
+        .split(&['?', '&'])
         .skip(1)
         .flat_map(|pair| pair.split_once('='))
 }

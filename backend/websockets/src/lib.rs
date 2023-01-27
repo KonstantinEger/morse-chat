@@ -1,10 +1,19 @@
-use std::{pin::Pin, task::{Context, Poll}, sync::Arc, collections::VecDeque};
+use std::{
+    collections::VecDeque,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
 
 use frame::{Frame, OpCode};
-use pin_project::pin_project;
 use futures::Future;
-use tokio::{net::TcpStream, task::{self, JoinHandle}, sync::Mutex};
+use pin_project::pin_project;
 use tokio::sync::mpsc::{self, Sender};
+use tokio::{
+    net::TcpStream,
+    sync::Mutex,
+    task::{self, JoinHandle},
+};
 
 mod frame;
 
@@ -70,7 +79,7 @@ impl WebSocket {
                         if should_close {
                             break;
                         }
-                    },
+                    }
                     NextStep::Write(cmd) => {
                         let should_close = if let Cmd::Send(msg) = cmd {
                             let res = write_message_to(msg, &mut stream).await;
@@ -82,7 +91,7 @@ impl WebSocket {
                         if should_close {
                             break;
                         }
-                    },
+                    }
                 }
             }
         });
@@ -163,7 +172,9 @@ async fn read_message_from(stream: &mut TcpStream) -> Result<Message, MessageErr
     }
 
     if let Some(true) = is_text {
-        Ok(Message::Text(String::from_utf8_lossy(message.as_slice()).to_string()))
+        Ok(Message::Text(
+            String::from_utf8_lossy(message.as_slice()).to_string(),
+        ))
     } else {
         Ok(Message::Binary(message))
     }
@@ -175,7 +186,9 @@ async fn write_message_to(message: Message, stream: &mut TcpStream) -> Result<()
         Message::Binary(bytes) => (OpCode::Binary, bytes),
     };
 
-    if bytes.len() == 0 { return Ok(()); }
+    if bytes.len() == 0 {
+        return Ok(());
+    }
 
     let chunks = bytes.chunks(1024).enumerate().collect::<Vec<_>>();
     let num_chunks = chunks.len();
@@ -192,11 +205,12 @@ async fn write_message_to(message: Message, stream: &mut TcpStream) -> Result<()
         } else {
             builder.with_opcode(OpCode::Continuation);
         }
-        builder.with_payload(chunk.to_owned())
+        builder
+            .with_payload(chunk.to_owned())
             .write_to(stream)
             .await?;
     }
-    
+
     Ok(())
 }
 
@@ -226,7 +240,7 @@ where
         let this = self.project();
         match this.stream.poll(ctx) {
             Poll::Ready(_) => return Poll::Ready(NextStep::Read),
-            _ => {},
+            _ => {}
         };
         match this.channel.poll(ctx) {
             Poll::Ready(cmd) => return Poll::Ready(NextStep::Write(cmd.unwrap())),
@@ -245,5 +259,4 @@ impl Cmd {
 }
 
 #[cfg(test)]
-mod tests {
-}
+mod tests {}
