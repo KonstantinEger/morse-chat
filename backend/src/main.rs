@@ -22,7 +22,9 @@ type SharedAppData = Arc<Mutex<AppData>>;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt().init();
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .init();
     info!("starting server.");
     let (ip, port) = ("0.0.0.0", 8080);
     let server = TcpListener::bind((ip, port)).await?;
@@ -61,10 +63,11 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
+#[tracing::instrument(skip(app_data))]
 async fn msg_listener_task(app_data: SharedAppData) {
     loop {
         let mut data = app_data.lock().await;
-        for (_, room) in &mut data.rooms {
+        for (room_name, room) in &mut data.rooms {
             let mut delete_members = Vec::new();
             // collect messages
             let mut messages = Vec::with_capacity(room.len());
@@ -75,16 +78,15 @@ async fn msg_listener_task(app_data: SharedAppData) {
                         delete_members.push(id);
                     }
                     Some(Ok(msg)) => {
-                        trace!(?msg);
+                        trace!(?msg, id, room_name);
                         messages.push((id, msg));
                     }
                     None => {}
                 }
             }
-            trace!("collected {} messages.", messages.len());
             // cleanup
             for id in delete_members {
-                debug!(id, "removing member from room.");
+                debug!(id, room_name, "removing member from room.");
                 room.remove(&id);
             }
             // send messages
