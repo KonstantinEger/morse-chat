@@ -1,192 +1,169 @@
-let ctx = null;
 const url = new URL(location.href);
 const roomName = url.searchParams.get("room");
-
 if (!roomName) {
     location.href = "/";
 }
-
 const ws = new WebSocket(`ws://${location.host}/ws?room=${roomName}`);
 
-document.querySelector("#activate-sound").addEventListener("click", () => {
-    ctx = new AudioContext();
-});
+ws.onmessage = onWebSocketMessage;
 
-ws.onmessage = onmessage;
-ws.onerror = onerror;
-ws.onclose = onclose;
-
-
-
-// ===== LISTENING =====
+const LETTER_PAUSE_SIGNAL = "letter_pause";
+const WORD_PAUSE_SIGNAL = "word_pause";
+const DIT_SIGNAL = "dit";
+const DAH_SIGNAL = "dah";
+const FLUSH_TIME = 1*1000;
 
 
-
-function onmessage(event) {
-    console.log("message", event);
-    if (event.data.startsWith("dit")) {
-        playCorrespondentDit(ctx);
-        const [_, name, ...rest] = event.data.split(":");
-        addMessage(name, ".");
-    } else if (event.data.startsWith("dah")) {
-        playCorrespondentDah(ctx);
-        const [_, name, ...rest] = event.data.split(":");
-        addMessage(name, "_");
-    } else if (event.data.startsWith("brk")) {
-        const [_, name, ...rest] = event.data.split(":");
-        addMessage(name, " ");
-    } else if (event.data.startsWith("spc")) {
-        const [_, name, ...rest] = event.data.split(":");
-        addMessage(name, " (Space) ");
-    }
-}
-
-function onerror(event) {
-    console.log("error", event);
-}
-
-function onclose(event) {
-    console.log("close", event);
-}
-
-
-
-// ===== SENDING =====
-
-
-
-const CALLSIGN = generateCallsign();
-document.querySelector("#callsign").textContent = CALLSIGN;
-
-let osc = null;
-const ditlen = 80;
-let pressed = false;
-const startTimes = {
-    press: null,
-    pause: null,
+const userData = {
+    isCurrentlyPressing: false,
+    pressStartTime: null,
+    pauseStartTime: null,
+    ditlen: 100,
+    callsign: generateCallsign(),
+    currentSignalsBuffer: [],
+    flushSignalBufferTimeout: null,
 };
 
-let spaceSignalAlreadySent = false;
-let spaceSignalTimeout = -1;
+document.querySelector("#callsign").textContent = userData.callsign;
 
-window.addEventListener("keydown", (event) => {
-    if (event.code !== "Space" || pressed) return;
-    pressed = true;
-    osc = getOscillator(ctx, 440);
-    osc?.start();
-    startTimes.press = performance.now();
+const peerUserStore = {};
 
-    clearTimeout(spaceSignalTimeout);
-
-    if (startTimes.pause === null) return;
-    const pauseDelta = performance.now() - startTimes.pause;
-    if (pauseDelta < 3*ditlen) {
-        // pause between symbols, do nothing
-    } else if (3*ditlen <= pauseDelta && pauseDelta < 7*ditlen) {
-        // pause between letters, start new letter
-        ws.send("brk:" + CALLSIGN);
-        addMessage(CALLSIGN, " ");
-    } else {
-        // pause between words, insert space
-        if (!spaceSignalAlreadySent) {
-            ws.send("spc:" + CALLSIGN);
-            addMessage(CALLSIGN, " (Space) ");
+function onWebSocketMessage(event) {
+    const [message, callsign] = event.data.split(":");
+    if (!document.querySelector("#messages > #" + callsign)) {
+        const userMessageElement = document.createElement("div");
+        userMessageElement.id = callsign;
+        document.querySelector("#messages").appendChild(userMessageElement);
+    }
+    if (!peerUserStore[callsign]) {
+        peerUserStore[callsign] = {
+            currentSignalsBuffer: [],
+            flushSignalBufferTimeout: null,
         }
     }
-});
+    clearTimeout(peerUserStore[callsign].flushSignalBufferTimeout);
+    peerUserStore[callsign].currentSignalsBuffer.push(message);
+    
+    const bubbleHTML = renderMessageBubbleHtml(callsign, peerUserStore[callsign].currentSignalsBuffer);
+    document.querySelector("#messages > #" + callsign).innerHTML = bubbleHTML;
+    
+    peerUserStore[callsign].flushSignalBufferTimeout = setTimeout(() => {
+        // todo: render flush
+        const bubbleHTML = renderMessageBubbleHtml(callsign, peerUserStore[callsign].currentSignalsBuffer);
+        document.querySelector("#old-messages").innerHTML += bubbleHTML;
 
-
-window.addEventListener("keyup", (event) => {
-    if (event.code !== "Space") return;
-    pressed = false;
-    osc?.stop();
-    startTimes.pause = performance.now();
-    const pressDelta = performance.now() - startTimes.press;
-    if (pressDelta < 3*ditlen) {
-        ws.send("dit:" + CALLSIGN);
-        addMessage(CALLSIGN, ".");
-    } else {
-        ws.send("dah:" + CALLSIGN);
-        addMessage(CALLSIGN, "_");
-    }
-
-    spaceSignalAlreadySent = false;
-    spaceSignalTimeout = setTimeout(() => {
-        ws.send("spc:" + CALLSIGN);
-        addMessage(CALLSIGN, " (Space) ");
-        spaceSignalAlreadySent = true;
-    }, 20*ditlen);
-});
-
-function getOscillator(ctx, hz) {
-    if (!ctx) return null;
-    const osc = ctx.createOscillator();
-    osc.type = "sine";
-    osc.frequency.setValueAtTime(hz, ctx.currentTime);
-    osc.connect(ctx.destination);
-    return osc;
+        document.querySelector("#messages > #" + callsign).innerHTML = "";
+        peerUserStore[callsign].currentSignalsBuffer = [];
+    }, FLUSH_TIME);
 }
 
-function generateCallsign(len = 5) {
-    let result = "";
-    for (let i = 0; i < len; i++) {
-        let code = Math.floor(Math.random() * 26) + 0x41;
-        result += String.fromCharCode(code);
+globalThis.addEventListener("keydown", event => {
+    if (event.code !== "Space" || userData.isCurrentlyPressing) return;
+    userData.pressStartTime = performance.now();
+    userData.isCurrentlyPressing = true;
+
+    // abort flushing signals buffer
+    clearTimeout(userData.flushSignalBufferTimeout);
+    
+    if (userData.pauseStartTime === null) return;
+    const pauseTime = performance.now() - userData.pauseStartTime;
+    if (3*userData.ditlen <= pauseTime && pauseTime < 7*userData.ditlen) {
+        // pause between letters
+        const signal = LETTER_PAUSE_SIGNAL;
+        ws.send(signal + ":" + userData.callsign);
+        userData.currentSignalsBuffer.push(signal);
+    } else if (7*userData.ditlen <= pauseTime) {
+        // pause between words
+        const signal = WORD_PAUSE_SIGNAL;
+        ws.send(signal + ":" + userData.callsign);
+        userData.currentSignalsBuffer.push(signal);
     }
+});
+
+globalThis.addEventListener("keyup", event => {
+    if (event.code !== "Space") return;
+    userData.pauseStartTime = performance.now();
+    userData.isCurrentlyPressing = false;
+    
+    if (userData.pressStartTime === null) return;
+    const pressTime = performance.now() - userData.pressStartTime;
+    let signal;
+    if (pressTime < 3 * userData.ditlen) {
+        signal = DIT_SIGNAL;
+    } else {
+        signal = DAH_SIGNAL;
+    }
+    ws.send(signal + ":" + userData.callsign);
+    userData.currentSignalsBuffer.push(signal);
+    
+    const currentSignalBufferHtml = signalsBufferToHtml(userData.currentSignalsBuffer);
+    document.querySelector("#own-current-message").innerHTML = currentSignalBufferHtml;
+    
+    // flush signals buffer
+    userData.flushSignalBufferTimeout = setTimeout(flushUserSignalBuffer, FLUSH_TIME);
+});
+
+function flushUserSignalBuffer() {
+    console.debug("flushing signal data buffer");
+
+    const bubbleHtml = renderMessageBubbleHtml(userData.callsign, userData.currentSignalsBuffer);
+    document.querySelector("#old-messages").innerHTML += bubbleHtml;
+
+    userData.pauseStartTime = null;
+    userData.pressStartTime = null;
+    userData.currentSignalsBuffer = [];
+    document.querySelector("#own-current-message").innerHTML = "";
+}
+
+function signalsBufferToHtml(signals) {
+    let result = "<div>";
+    let currentLetterBuff = [];
+    for (const signal of signals) {
+        if (signal === DIT_SIGNAL || signal === DAH_SIGNAL) {
+            result += ditDahToDotDashUni(signal);
+            const dotOrDash = ditDahToDotDashPunct(signal);
+            currentLetterBuff.push(dotOrDash);
+        } else {
+            const letter = morseSignToLetter(currentLetterBuff.join(""));
+            result += `<span class="text-gray-300">(${letter})</span>`;
+            currentLetterBuff = [];
+        }
+    }
+    const letter = morseSignToLetter(currentLetterBuff.join(""));
+    result += `<span class="text-gray-300">(${letter})</span>`;
+    result += "</div>"
     return result;
 }
 
-function playCorrespondentDit(ctx) {
-    const osc = getOscillator(ctx, 880);
-    osc?.start();
-    setTimeout(() => osc?.stop(), ditlen);
+function renderMessageBubbleHtml(callsign, signals) {
+    let bubble = `<div class="gap-3 flex ${callsign === userData.callsign ? "flex-row-reverse" : "fex-row"}">`;
+    bubble += `<div class="bg-white drop-shadow rounded-full flex justify-center items-center p-3">${callsign}</div>`;
+    bubble += `<div class="bg-white drop-shadow px-5 py-4 rounded-xl">${signalsBufferToHtml(signals)}</div>`;
+    bubble += "</div>";
+    return bubble;
 }
 
-function playCorrespondentDah(ctx) {
-    const osc = getOscillator(ctx, 880);
-    osc?.start();
-    setTimeout(() => osc?.stop(), ditlen*3);
-}
-
-
-
-const messages = {}
-messages[CALLSIGN] = [];
-
-function addMessage(user, msg) {
-    if (!messages[user])
-        messages[user] = [];
-    messages[user].push(msg);
-    console.log(messages);
-    renderMessages();
-}
-
-function renderMessages() {
-    const parent = document.querySelector("#messages");
-    parent.innerHTML = "";
-    for (const name in messages) {
-        const line = document.createElement("div");
-        line.textContent += name;
-        line.textContent += ": ";
-
-        let signalsBuffer = [];
-        for (const message of messages[name]) {
-            if (message === " " || message === " (Space) ") {
-                const parsed = signalsToLetter(signalsBuffer);
-                signalsBuffer = [];
-                line.textContent += " (" + parsed + ")";
-            } else if (message !== " (Space) ") {
-                signalsBuffer.push(message);
-            }
-            line.textContent += message;
-        }
-        parent.appendChild(line);
+function ditDahToDotDashPunct(s) {
+    if (s === DIT_SIGNAL) {
+        return ".";
+    } else if (s === DAH_SIGNAL) {
+        return "_";
+    } else {
+        return s;
     }
 }
 
-function signalsToLetter(sigs) {
-    const signals = sigs.join("");
+function ditDahToDotDashUni(s) {
+    if (s === DIT_SIGNAL) {
+        return "&bull;";
+    } else if (s === DAH_SIGNAL) {
+        return "&mdash;";
+    } else {
+        return s;
+    }
+}
 
+function morseSignToLetter(signals) {
     if (signals === "._") return "A"
     else if (signals === "_...") return "B"
     else if (signals === "_._.") return "C"
@@ -227,3 +204,11 @@ function signalsToLetter(sigs) {
     else return "{{?}}";
 }
 
+function generateCallsign(len = 5) {
+    let result = "";
+    for (let i = 0; i < len; i++) {
+        const code = Math.floor(Math.random() * 26) + 0x41;
+        result += String.fromCharCode(code);
+    }
+    return result;
+}
