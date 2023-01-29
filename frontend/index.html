@@ -1,11 +1,29 @@
 <!DOCTYPE html>
 <html lang="en">
     <head>
-        <title></title>
+        <title>morse chat</title>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
+          <script type="module" src="/scripts/index.js"></script>
+        <script src="https://cdn.tailwindcss.com"></script>
+        <script>
+            tailwind.config = {
+              theme: {
+                fontFamily: {
+                    serif: ["Roboto Slab", "serif"],
+                    sans: ["Roboto Slab", "serif"],
+                }
+              }
+            }
+          </script>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto+Slab">
     </head>
     <body>
-        <h1>Hello World</h1>
+        <h1 class="text-4xl">morse chat</h1>
+        <span class="text-lg">konstantin eger</span>
+        <div id="rooms-container" class="flex flex-col gap-3"></div>
+        <div class="flex">
+            <button id="create-room-btn" class="mt-3 text-center bg-white drop-shadow gap-3 rounded w-3/4 md:w-96 mx-auto px-4 py-3">create room</button>
+        </div>
     </body>
 </html>

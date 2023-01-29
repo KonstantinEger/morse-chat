@@ -6,6 +6,7 @@ if (!roomName) {
 const ws = new WebSocket(`ws://${location.host}/ws?room=${roomName}`);
 
 ws.onmessage = onWebSocketMessage;
+ws.onerror = onWebSocketError;
 
 const LETTER_PAUSE_SIGNAL = "letter_pause";
 const WORD_PAUSE_SIGNAL = "word_pause";
@@ -25,11 +26,25 @@ const userData = {
 };
 
 document.querySelector("#callsign").textContent = userData.callsign;
+document.querySelector("#room-name").textContent = roomName;
+{
+    const userMsgDiv = document.createElement("div");
+    userMsgDiv.id = userData.callsign;
+    document.querySelector("#messages").appendChild(userMsgDiv);
+}
 
 const peerUserStore = {};
 
 function onWebSocketMessage(event) {
     const [message, callsign] = event.data.split(":");
+    if (!isValidCallsign(callsign)) {
+        console.info(`received message with invalid callsign "${callsign}". ignoring message.`);
+        return;
+    }
+    if (!isValidSignal(message)) {
+        console.info(`received invalid signal "${message}". ignoring message.`);
+        return;
+    }
     if (!document.querySelector("#messages > #" + callsign)) {
         const userMessageElement = document.createElement("div");
         userMessageElement.id = callsign;
@@ -55,6 +70,12 @@ function onWebSocketMessage(event) {
         document.querySelector("#messages > #" + callsign).innerHTML = "";
         peerUserStore[callsign].currentSignalsBuffer = [];
     }, FLUSH_TIME);
+}
+
+function onWebSocketError(error) {
+    console.error(error);
+    alert("An error occurred. Redirecting to home");
+    location.href = "/";
 }
 
 globalThis.addEventListener("keydown", event => {
@@ -96,8 +117,8 @@ globalThis.addEventListener("keyup", event => {
     ws.send(signal + ":" + userData.callsign);
     userData.currentSignalsBuffer.push(signal);
     
-    const currentSignalBufferHtml = signalsBufferToHtml(userData.currentSignalsBuffer);
-    document.querySelector("#own-current-message").innerHTML = currentSignalBufferHtml;
+    const bubbleHTML = renderMessageBubbleHtml(userData.callsign, userData.currentSignalsBuffer);
+    document.querySelector("#messages > #" + userData.callsign).innerHTML = bubbleHTML;
     
     // flush signals buffer
     userData.flushSignalBufferTimeout = setTimeout(flushUserSignalBuffer, FLUSH_TIME);
@@ -112,7 +133,7 @@ function flushUserSignalBuffer() {
     userData.pauseStartTime = null;
     userData.pressStartTime = null;
     userData.currentSignalsBuffer = [];
-    document.querySelector("#own-current-message").innerHTML = "";
+    document.querySelector("#messages > #" + userData.callsign).innerHTML = "";
 }
 
 function signalsBufferToHtml(signals) {
@@ -211,4 +232,25 @@ function generateCallsign(len = 5) {
         result += String.fromCharCode(code);
     }
     return result;
+}
+
+function isValidCallsign(sign) {
+    return sign.length === 5 && isAlphabetic(sign);
+}
+
+function isAlphabetic(sign) {
+    const signUpper = sign.toUpperCase();
+    let result = true;
+    for (const c of signUpper) {
+        const code = c.charCodeAt(0);
+        result = result && 0x41 <= code && code <= 0x5a;
+    }
+    return result;
+}
+
+function isValidSignal(signal) {
+    return signal === DIT_SIGNAL
+        || signal === DAH_SIGNAL
+        || signal === LETTER_PAUSE_SIGNAL
+        || signal === WORD_PAUSE_SIGNAL;
 }
