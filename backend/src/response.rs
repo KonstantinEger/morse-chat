@@ -16,6 +16,7 @@ pub enum Status {
     #[default]
     OK,
     BadRequest,
+    Forbidden,
     NotFound,
     InternalServerError,
 }
@@ -38,10 +39,12 @@ impl Response {
 
     pub fn into_bytes(self) -> Vec<u8> {
         let first_line = format!("HTTP/1.1 {}\r\n", self.status.as_str());
-        let headers = self.headers.into_iter()
+        let headers = self
+            .headers
+            .into_iter()
             .map(|(hn, hv)| format!("{}: {}\r\n", hn.as_str(), hv))
             .collect::<String>();
-        
+
         let complete_header = first_line + &headers + "\r\n";
 
         let mut result = complete_header.into_bytes();
@@ -56,6 +59,7 @@ impl Status {
             Self::SwitchingProtocols => "101 Switching Protocols",
             Self::OK => "200 OK",
             Self::BadRequest => "400 Bad Request",
+            Self::Forbidden => "403 Forbidden",
             Self::NotFound => "404 Not Found",
             Self::InternalServerError => "500 Internal Server Error",
         }
@@ -80,8 +84,13 @@ impl Builder {
         self.with_header("content-type", "text/html")
     }
 
+    pub fn as_json(&mut self) -> &mut Self {
+        self.with_header("content-type", "application/json")
+    }
+
     pub fn with_header<N: AsRef<str>, V: Into<String>>(&mut self, name: N, value: V) -> &mut Self {
-        self.headers.insert(HeaderName::from_str(name.as_ref()), value.into());
+        self.headers
+            .insert(HeaderName::from_str(name.as_ref()), value.into());
         self
     }
 
