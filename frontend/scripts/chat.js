@@ -4,6 +4,8 @@ if (!roomName) {
     location.href = "/";
 }
 const ws = new WebSocket(`ws://${location.host}/ws?room=${roomName}`);
+let ctx = null;
+let ownOsc = null;
 
 ws.onmessage = onWebSocketMessage;
 ws.onerror = onWebSocketError;
@@ -60,6 +62,12 @@ function onWebSocketMessage(event) {
     clearTimeout(peerUserStore[callsign].flushSignalBufferTimeout);
     peerUserStore[callsign].currentSignalsBuffer.push(message);
     
+    if (message === DIT_SIGNAL) {
+        playIncomingDit(ctx, userData.ditlen);
+    } else if (message === DAH_SIGNAL) {
+        playIncomingDah(ctx, userData.ditlen);
+    }
+    
     const bubbleHTML = renderMessageBubbleHtml(callsign, peerUserStore[callsign].currentSignalsBuffer);
     document.querySelector("#messages > #" + callsign).innerHTML = bubbleHTML;
     
@@ -80,10 +88,16 @@ function onWebSocketError(error) {
 }
 
 globalThis.addEventListener("keydown", event => {
+    if (!ctx) {
+        ctx = new AudioContext();
+    }
     if (event.code !== "Space" || userData.isCurrentlyPressing) return;
     userData.pressStartTime = performance.now();
     userData.isCurrentlyPressing = true;
-
+    
+    ownOsc = createOsc(ctx, 440);
+    ownOsc?.start();
+    
     // abort flushing signals buffer
     clearTimeout(userData.flushSignalBufferTimeout);
     
@@ -106,6 +120,8 @@ globalThis.addEventListener("keyup", event => {
     if (event.code !== "Space") return;
     userData.pauseStartTime = performance.now();
     userData.isCurrentlyPressing = false;
+    
+    ownOsc?.stop();
     
     if (userData.pressStartTime === null) return;
     const pressTime = performance.now() - userData.pressStartTime;
@@ -254,4 +270,27 @@ function isValidSignal(signal) {
         || signal === DAH_SIGNAL
         || signal === LETTER_PAUSE_SIGNAL
         || signal === WORD_PAUSE_SIGNAL;
+}
+
+function createOsc(ctx, hz) {
+    if (!ctx) return null;
+    const osc = ctx.createOscillator();
+    osc.type = "sine";
+    osc.frequency.setValueAtTime(hz, ctx.currentTime);
+    osc.connect(ctx.destination);
+    return osc;
+}
+
+function playIncomingDit(ctx, ditlen) {
+    if (!ctx) return;
+    const osc = createOsc(ctx, 880);
+    osc?.start();
+    setTimeout(() => osc?.stop(), ditlen);
+}
+
+function playIncomingDah(ctx, ditlen) {
+    if (!ctx) return;
+    const osc = createOsc(ctx, 880);
+    osc?.start();
+    setTimeout(() => osc?.stop(), 3*ditlen);
 }
