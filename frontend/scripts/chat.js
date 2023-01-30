@@ -36,6 +36,7 @@ document.querySelector("#room-name").textContent = roomName;
 const peerUserStore = {};
 
 function onWebSocketMessage(event) {
+    if (typeof event.data !== "string") return;
     const [message, callsign] = event.data.split(":");
     if (!isValidCallsign(callsign)) {
         console.info(`received message with invalid callsign "${callsign}". ignoring message.`);
